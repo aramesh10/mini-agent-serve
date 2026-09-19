@@ -7,6 +7,7 @@ from typing import Callable
 from collections import deque
 
 from tokenizers import Tokenizer
+from tokenizers.decoders import DecodeStream
 
 from miniagentserve.engine.model_runner import ModelRunner
 from miniagentserve.engine.block_manager import KVBlockManager
@@ -29,12 +30,13 @@ class ServingEngine:
                 time.sleep(0.001)
                 continue
             for seq in self.step():
-                seq.on_token(self.tokenizer.decode(seq.completion_token_ids), seq.finished)
+                seq.on_token(seq.decoder.step(self.tokenizer, seq.token_ids[-1]) or "", seq.finished)
 
     def add_request(self, prompt: str, sampling_params: SamplingParams = SamplingParams(), on_token: Callable[[str, bool], None] | None = None):
         bos_token_id = self.model_runner.model.config.bos_token_id
         prompt = [bos_token_id] + self.tokenizer.encode(prompt).ids
         seq = Sequence(prompt, sampling_params, on_token)
+        seq.decoder = DecodeStream(skip_special_tokens=True)
         self.waiting.append(seq)
         return seq
 

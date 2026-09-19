@@ -19,7 +19,7 @@ class Sequence:
         self.block_table: list[int] = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
-        self.on_token = on_token            # called each step with (completion text so far, finished)
+        self.on_token = on_token            # called each step with (new text, finished)
         self.finished = False
 
     def __len__(self):

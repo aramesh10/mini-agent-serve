@@ -19,14 +19,10 @@ async def generate(req: Request):
     engine.add_request(req.prompt, req, lambda text, finished: loop.call_soon_threadsafe(queue.put_nowait, (text, finished)))
 
     async def stream():
-        sent = 0
-        while True:
+        finished = False
+        while not finished:
             text, finished = await queue.get()
-            # hold back a trailing partial UTF-8 char until later tokens complete it
-            if (finished or not text.endswith("�")) and len(text) > sent:
-                yield text[sent:]
-                sent = len(text)
-            if finished:
-                return
+            if text:
+                yield text
 
     return StreamingResponse(stream(), media_type="text/plain")
