@@ -1,6 +1,7 @@
 """
 sequence.py
 """
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -21,6 +22,8 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.on_token = on_token            # called each step with (new text, finished)
         self.finished = False
+        self.arrival_time = self.enqueue_time = time.perf_counter()
+        self.first_token_time: float | None = None
 
     def __len__(self):
         return len(self.token_ids)

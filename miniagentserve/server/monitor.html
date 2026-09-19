@@ -1,0 +1,52 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>mini-agent-serve</title>
+<style>
+  body { margin: 24px; background: #fff; color: #000; font: 14px/1.6 ui-monospace, Menlo, monospace; }
+  pre { font: inherit; margin: 0; overflow-x: auto; }
+</style>
+</head>
+<body>
+<pre id="out">loading...</pre>
+<script>
+const f = (v, d = 1) => Number.isFinite(v) ? v.toFixed(d) : "-";
+const mean = xs => (xs = xs.filter(x => x != null)).length ? xs.reduce((a, b) => a + b) / xs.length : null;
+const row = cols => cols.map(c => String(c).padStart(12)).join("");
+const text = s => (s || "").replace(/\s+/g, " ").slice(0, 50).padEnd(50);
+
+const out = document.getElementById("out");
+let e = {}, r = [];  // latest engine sample and finished requests, oldest first
+
+const events = new EventSource("/metrics/stream");
+events.onopen = () => { e = {}; r = []; };  // the server resends the full history on every (re)connect
+events.onerror = () => { out.textContent = "disconnected"; };
+events.onmessage = msg => {
+  const m = JSON.parse(msg.data);
+  e = m.engine[m.engine.length - 1] || e;
+  r = r.concat(m.requests).slice(-100);
+  render();
+};
+
+function render() {
+  out.textContent = [
+    "mini-agent-serve",
+    "",
+    `output tokens/s      ${f(e.output_tokens_per_s)}`,
+    `gpu utilization      ${f(e.gpu_utilization * 100, 0)}%`,
+    `kv-cache utilization ${f(e.kv_cache_utilization * 100)}%`,
+    `queueing latency     ${f(e.queueing_latency_ms)} ms`,
+    "",
+    `mean of last ${r.length} requests`,
+    `ttft                 ${f(mean(r.map(x => x.ttft_ms)))} ms`,
+    `tpot                 ${f(mean(r.map(x => x.tpot_ms)))} ms/token`,
+    `e2e                  ${f(mean(r.map(x => x.e2e_ms)))} ms`,
+    "",
+    `${row(["ttft ms", "tpot ms", "e2e ms", "tokens"])}  ${text("prompt")}  response`,
+    ...r.slice(-20).reverse().map(x => `${row([f(x.ttft_ms), f(x.tpot_ms), f(x.e2e_ms), x.output_tokens])}  ${text(x.prompt)}  ${text(x.response)}`),
+  ].join("\n");
+}
+</script>
+</body>
+</html>

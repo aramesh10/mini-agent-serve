@@ -25,6 +25,9 @@ from miniagentserve.models.utils import _resolve_checkpoint_dir
 
 __all__ = ["Devstral2Model", "Devstral2ForCausalLM"]
 
+FP8 = torch.float8_e4m3fn
+FP8_MAX = torch.finfo(FP8).max
+
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -99,6 +102,22 @@ class Devstral2RotaryEmbedding(nn.Module):
         return cos.to(x.dtype), sin.to(x.dtype)
 
 
+class FP8Linear(nn.Module):
+
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        self.register_buffer("weight", torch.empty(out_features, in_features, dtype=FP8))
+        self.register_buffer("weight_scale_inv", torch.empty(()))
+        self.register_buffer("activation_scale", torch.empty(()))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_fp8 = (x / self.activation_scale).clamp(-FP8_MAX, FP8_MAX).to(FP8).flatten(0, -2)
+        out = torch._scaled_mm(
+            x_fp8, self.weight.t(), scale_a=self.activation_scale, scale_b=self.weight_scale_inv, out_dtype=x.dtype
+        )
+        return out.unflatten(0, x.shape[:-1])
+
+
 @dataclass
 class AttentionMetadata:
     """Per-step inputs shared by every attention layer."""
@@ -120,10 +139,10 @@ class Devstral2Attention(nn.Module):
         self.llama_4_scaling_beta = config.llama_4_scaling_beta
         self.original_max_position_embeddings = config.rope_original_max_position_embeddings
 
-        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
+        self.q_proj = FP8Linear(config.hidden_size, config.num_attention_heads * self.head_dim)
+        self.k_proj = FP8Linear(config.hidden_size, config.num_key_value_heads * self.head_dim)
+        self.v_proj = FP8Linear(config.hidden_size, config.num_key_value_heads * self.head_dim)
+        self.o_proj = FP8Linear(config.num_attention_heads * self.head_dim, config.hidden_size)
 
     def forward(
         self, hidden_states: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, attn: AttentionMetadata
@@ -167,9 +186,9 @@ class Devstral2Attention(nn.Module):
 class Devstral2MLP(nn.Module):
     def __init__(self, config: Devstral2Config):
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.gate_proj = FP8Linear(config.hidden_size, config.intermediate_size)
+        self.up_proj = FP8Linear(config.hidden_size, config.intermediate_size)
+        self.down_proj = FP8Linear(config.intermediate_size, config.hidden_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
@@ -298,9 +317,9 @@ class Devstral2ForCausalLM(Model):
         """Load a released checkpoint (local directory or HF repo id).
 
         The released checkpoints wrap the decoder in a multimodal model, so weights are
-        prefixed `language_model.` and the vision tower is skipped. Linear weights are
-        stored as fp8 (e4m3) with a scalar `weight_scale_inv`; they are dequantized to
-        `dtype`, which defaults to the precision recorded in the config.
+        prefixed `language_model.` and the vision tower is skipped. Decoder linear weights
+        stay fp8 (e4m3) with scalar fp32 `weight_scale_inv`/`activation_scale`; everything
+        else is cast to `dtype`, which defaults to the precision recorded in the config.
         """
         path = _resolve_checkpoint_dir(path)
         config = Devstral2Config.from_json(os.path.join(path, "config.json"))
@@ -319,12 +338,11 @@ class Devstral2ForCausalLM(Model):
                     if name is None:
                         continue
                     weight = f.get_tensor(key)
-                    if weight.dtype == torch.float8_e4m3fn:
-                        scale = f.get_tensor(key + "_scale_inv").to(dtype)
-                        weight = weight.to(device=device, dtype=dtype) * scale.to(device)
-                    else:
-                        weight = weight.to(device=device, dtype=dtype)
-                    state_dict[name] = weight
+                    if key.endswith(("_scale_inv", "_scale")):
+                        weight = weight.float()
+                    elif weight.dtype != FP8:
+                        weight = weight.to(dtype)
+                    state_dict[name] = weight.to(device)
 
         if config.tie_word_embeddings:
             # `assign=True` installs Parameters as-is, so one Parameter under both keys stays tied.

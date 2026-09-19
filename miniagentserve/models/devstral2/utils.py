@@ -28,6 +28,4 @@ def _convert_key(key: str) -> str | None:
         key = key[len("language_model.") :]
     if key.startswith(("model.vision_tower", "model.multi_modal_projector", "vision_tower", "multi_modal_projector")):
         return None
-    if key.endswith((".weight_scale_inv", ".activation_scale")):
-        return None  # consumed alongside the weight they scale
     return key
