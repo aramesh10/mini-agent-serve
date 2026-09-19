@@ -12,14 +12,15 @@ class SamplingParams:
 
 class Sequence:
 
-    def __init__(self, token_ids: list[int], sampling_params: SamplingParams = SamplingParams(), on_finish: Callable[[str], None] | None = None):
+    def __init__(self, token_ids: list[int], sampling_params: SamplingParams = SamplingParams(), on_token: Callable[[str, bool], None] | None = None):
         self.token_ids = token_ids
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0          # tokens whose K/V are already in the cache
         self.block_table: list[int] = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
-        self.on_finish = on_finish
+        self.on_token = on_token            # called each step with (completion text so far, finished)
+        self.finished = False
 
     def __len__(self):
         return len(self.token_ids)

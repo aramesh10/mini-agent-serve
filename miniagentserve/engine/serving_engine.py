@@ -28,14 +28,13 @@ class ServingEngine:
             if self.has_no_work():
                 time.sleep(0.001)
                 continue
-            next_tokens = self.step()
-            for seq in next_tokens:
-                seq.on_finish(self.tokenizer.decode(seq.completion_token_ids))
+            for seq in self.step():
+                seq.on_token(self.tokenizer.decode(seq.completion_token_ids), seq.finished)
 
-    def add_request(self, prompt: str, sampling_params: SamplingParams = SamplingParams(), on_finish: Callable[[str], None] | None = None):
+    def add_request(self, prompt: str, sampling_params: SamplingParams = SamplingParams(), on_token: Callable[[str, bool], None] | None = None):
         bos_token_id = self.model_runner.model.config.bos_token_id
         prompt = [bos_token_id] + self.tokenizer.encode(prompt).ids
-        seq = Sequence(prompt, sampling_params, on_finish)
+        seq = Sequence(prompt, sampling_params, on_token)
         self.waiting.append(seq)
         return seq
 
@@ -68,19 +67,18 @@ class ServingEngine:
         return scheduled
 
     def step(self) -> list[Sequence]:
-        """Runs one forward step and returns the sequences that finished in it."""
+        """Runs one forward step and returns the sequences that advanced in it."""
         seqs = self.schedule()
         token_ids = self.model_runner.run(seqs)
         eos_token_id = self.model_runner.model.config.eos_token_id
-        finished = []
         for seq, token_id in zip(seqs, token_ids):
             seq.num_cached_tokens = len(seq)
             seq.token_ids.append(token_id)
-            if token_id == eos_token_id or len(seq.completion_token_ids) == seq.max_tokens:
+            seq.finished = token_id == eos_token_id or len(seq.completion_token_ids) == seq.max_tokens
+            if seq.finished:
                 self.running.remove(seq)
                 self.block_manager.deallocate(seq)
-                finished.append(seq)
-        return finished
+        return seqs
 
     def has_no_work(self):
         return not self.waiting and not self.running
