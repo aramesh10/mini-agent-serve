@@ -29,9 +29,14 @@ WORKLOAD = [
 
 
 def stream_miniagentserve(url: str, prompt: str, model: str | None = None):
-    resp = requests.post(f"{url}/generate", json={"prompt": prompt, "temperature": 0.0, "max_tokens": 32}, stream=True)
+    resp = requests.post(f"{url}/v1/responses", json={"input": prompt, "temperature": 0.0, "max_output_tokens": 32}, stream=True)
     resp.raise_for_status()
-    yield from resp.iter_content(chunk_size=None, decode_unicode=True)
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line.startswith("data: "):
+            continue
+        event = json.loads(line[len("data: "):])
+        if event["type"] == "response.output_text.delta":
+            yield event["delta"]
 
 
 def stream_vllm(url: str, prompt: str, model: str):
@@ -58,17 +63,19 @@ def run(url: str, vllm: bool = False, n_times: int = 1) -> list[dict]:
     for i, item in enumerate(WORKLOAD * n_times):
         print(f"[{i}] prompt: {item['prompt']!r}", flush=True)
         start = time.perf_counter()
-        ttft = None
+        ttft = last_chunk = None
         print(f"[{i}] response: ", end="", flush=True)
         text = ""
         for chunk in stream(url, item["prompt"], model):
-            if ttft is None and chunk:
-                ttft = time.perf_counter() - start
+            if chunk:
+                last_chunk = time.perf_counter() - start
+                ttft = ttft if ttft is not None else last_chunk
             print(chunk, end="", flush=True)
             text += chunk
         latency = time.perf_counter() - start
         num_tokens = len(tokenizer.encode(text, add_special_tokens=False).ids)
-        tpot = (latency - ttft) / (num_tokens - 1) if ttft is not None and num_tokens > 1 else None
+        # up to the last text chunk: a trailing EOS step streams no text but would otherwise count as a token's time
+        tpot = (last_chunk - ttft) / (num_tokens - 1) if ttft is not None and num_tokens > 1 else None
         print(f"\n[{i}] latency: {latency:.2f}s  ttft: {fmt_ms(ttft)}  tpot: {fmt_ms(tpot)}  tokens: {num_tokens}\n", flush=True)
         results.append({**item, "text": text, "latency_s": latency, "ttft_s": ttft, "tpot_s": tpot, "num_tokens": num_tokens})
     return results

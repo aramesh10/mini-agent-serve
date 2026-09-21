@@ -28,4 +28,7 @@ def _convert_key(key: str) -> str | None:
         key = key[len("language_model.") :]
     if key.startswith(("model.vision_tower", "model.multi_modal_projector", "vision_tower", "multi_modal_projector")):
         return None
+    # The RMS norms are bare parameters on the module that uses them, so they lose the `.weight`.
+    if key.endswith("layernorm.weight") or key == "model.norm.weight":
+        key = key[: -len(".weight")]
     return key

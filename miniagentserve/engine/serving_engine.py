@@ -27,6 +27,16 @@ class ServingEngine:
         self.num_generated_tokens = 0
         self.request_metrics: deque[dict] = deque(maxlen=100)  # most recent finished requests
         self.request_ids = itertools.count()                   # in finish order, so readers can tell which are new
+        self.warmup()
+
+    def warmup(self, n: int = 10):
+        for i in range(n):  # distinct prompt lengths so the dynamic-shape prefill gets compiled too
+            self.add_request("warmup " * (i + 1), SamplingParams(max_tokens=4))
+            while not self.has_no_work():
+                self.step()
+        self.num_generated_tokens = 0
+        self.request_metrics.clear()
+        self.request_ids = itertools.count()
 
     def run(self):
         while True:
