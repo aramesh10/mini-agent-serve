@@ -5,6 +5,9 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
+from tokenizers import Tokenizer
+from tokenizers.decoders import DecodeStream
+
 
 @dataclass
 class SamplingParams:
@@ -21,6 +24,7 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.on_token = on_token            # called each step with (new text, finished)
+        self.decoder = DecodeStream(skip_special_tokens=True)
         self.finished = False
         self.arrival_time = self.enqueue_time = time.perf_counter()
         self.first_token_time: float | None = None
@@ -31,3 +35,8 @@ class Sequence:
     @property
     def completion_token_ids(self):
         return self.token_ids[self.num_prompt_tokens:]
+
+    def emit(self, tokenizer: Tokenizer):
+        """Streams the token just appended to the client, if it is listening."""
+        if self.on_token is not None:
+            self.on_token(self.decoder.step(tokenizer, self.token_ids[-1]) or "", self.finished)

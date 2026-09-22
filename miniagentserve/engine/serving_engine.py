@@ -2,18 +2,20 @@
 serving_engine.py
 """
 import itertools
+import logging
 import os
 import time
 from typing import Callable
 from collections import deque
 
 from tokenizers import Tokenizer
-from tokenizers.decoders import DecodeStream
 
 from miniagentserve.engine.model_runner import ModelRunner
 from miniagentserve.engine.block_manager import KVBlockManager
 from miniagentserve.engine.sequence import SamplingParams, Sequence
 from miniagentserve.models.utils import _resolve_checkpoint_dir
+
+logger = logging.getLogger(__name__)
 
 class ServingEngine:
 
@@ -39,18 +41,22 @@ class ServingEngine:
         self.request_ids = itertools.count()
 
     def run(self):
+        """Engine loop: runs until the process exits, and outlives any one request's failures."""
         while True:
             if self.has_no_work():
                 time.sleep(0.001)
                 continue
             for seq in self.step():
-                seq.on_token(seq.decoder.step(self.tokenizer, seq.token_ids[-1]) or "", seq.finished)
+                try:
+                    seq.emit(self.tokenizer)
+                except Exception:      # a disconnected client must not take the engine down with it
+                    logger.exception("on_token callback failed; dropping the stream for this sequence")
+                    seq.on_token = None
 
     def add_request(self, prompt: str, sampling_params: SamplingParams = SamplingParams(), on_token: Callable[[str, bool], None] | None = None):
         bos_token_id = self.model_runner.model.config.bos_token_id
         prompt = [bos_token_id] + self.tokenizer.encode(prompt).ids
         seq = Sequence(prompt, sampling_params, on_token)
-        seq.decoder = DecodeStream(skip_special_tokens=True)
         self.waiting.append(seq)
         return seq
 
