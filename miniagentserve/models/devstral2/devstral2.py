@@ -125,10 +125,13 @@ class AttentionMetadata:
     kv_indptr: torch.Tensor                 
     kv_last_page_len: torch.Tensor          
     seq_lens: torch.Tensor
-    max_seq_len: int                        
-    q_len: int
-    cum_seq_lens_q: torch.Tensor | None   
-    cum_seq_lens_kv: torch.Tensor | None
+    num_decodes: int                        # rows [0, num_decodes) decode one token each; the rest are prompt chunks
+    num_prefills: int
+    max_seq_len: int                        # bound on a decode row's kv length
+    max_q_len: int                          # bounds on a prompt row's query and kv lengths
+    max_kv_len: int
+    cum_seq_lens_q: torch.Tensor            # (num_prefills + 1,) prompt rows' token offsets, from the first prompt token
+    cum_seq_lens_kv: torch.Tensor           # (num_prefills + 1,)
     workspace: torch.Tensor
 
 
@@ -174,21 +177,37 @@ class Devstral2Attention(nn.Module):
             )
             query_states = query_states * attn_scale[:, None, None].to(query_states.dtype)
 
-        kv = (k_cache, v_cache)
-        if attn.q_len == 1:
-            attn_output = trtllm_batch_decode_with_kv_cache(
-                query=query_states, kv_cache=kv, workspace_buffer=attn.workspace,
-                block_tables=attn.block_tables, seq_lens=attn.seq_lens,
-                max_seq_len=attn.max_seq_len, bmm1_scale=self.scaling, bmm2_scale=1.0,
+        # Decode rows and prompt rows go to the kernel built for each, writing to their slice of one output.
+        kv, d = (k_cache, v_cache), attn.num_decodes
+        attn_output = torch.empty(query_states.shape, dtype=query_states.dtype, device=query_states.device)
+        if attn.num_decodes:
+            trtllm_batch_decode_with_kv_cache(
+                query=query_states[:d], 
+                kv_cache=kv, 
+                workspace_buffer=attn.workspace,
+                block_tables=attn.block_tables[:d], 
+                seq_lens=attn.seq_lens[:d],
+                max_seq_len=attn.max_seq_len, 
+                bmm1_scale=self.scaling,
+                bmm2_scale=1.0,
+                out=attn_output[:d],
                 kv_layout="NHD",
             )
-        else:
-            attn_output = trtllm_batch_context_with_kv_cache(
-                query=query_states, kv_cache=kv, workspace_buffer=attn.workspace,
-                block_tables=attn.block_tables, seq_lens=attn.seq_lens,
-                max_q_len=attn.q_len, max_kv_len=attn.max_seq_len, bmm1_scale=self.scaling,
-                bmm2_scale=1.0, batch_size=attn.seq_lens.numel(),
-                cum_seq_lens_q=attn.cum_seq_lens_q, cum_seq_lens_kv=attn.cum_seq_lens_kv,
+        if attn.num_prefills:
+            trtllm_batch_context_with_kv_cache(
+                query=query_states[d:], 
+                kv_cache=kv, 
+                workspace_buffer=attn.workspace,
+                block_tables=attn.block_tables[d:], 
+                seq_lens=attn.seq_lens[d:],
+                max_q_len=attn.max_q_len, 
+                max_kv_len=attn.max_kv_len, 
+                bmm1_scale=self.scaling,
+                bmm2_scale=1.0, 
+                batch_size=attn.num_prefills,
+                cum_seq_lens_q=attn.cum_seq_lens_q, 
+                cum_seq_lens_kv=attn.cum_seq_lens_kv,
+                out=attn_output[d:],
                 kv_layout="NHD",
             )
         return self.o_proj(attn_output.flatten(1))
@@ -246,40 +265,36 @@ class Devstral2Model(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor,        # (num_tokens,) every sequence's new tokens, back to back
         *,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        block_tables: torch.Tensor,
-        cache_lens: torch.Tensor,
-    ) -> torch.Tensor:
-        batch, q_len = input_ids.shape
+        k_cache: torch.Tensor,          # (num_layers, num_blocks + 1, block_size, kv_heads, head_dim) paged K cache
+        v_cache: torch.Tensor,          # same shape, paged V cache
+        positions: torch.Tensor,        # (num_tokens,) each token's position in its sequence
+        batch_indices: torch.Tensor,    # (num_tokens,) the sequence each token belongs to
+        seq_lens: torch.Tensor,         # (batch,) cached plus new tokens per sequence; decode rows first, one token each
+        cu_seqlens_q: torch.Tensor,     # (num_prefills + 1,) prompt row j owns tokens num_decodes + cu_seqlens_q[j : j + 2]
+        block_tables: torch.Tensor,     # (batch, max_blocks) the cache blocks each sequence's tokens live in
+    ) -> torch.Tensor:                  # (num_tokens, hidden_size) final hidden states
+        num_tokens, batch, num_prefills = input_ids.shape[0], seq_lens.shape[0], cu_seqlens_q.shape[0] - 1
+        num_decodes = batch - num_prefills   # every count comes from a shape, so graphs capture them as constants
         device = input_ids.device
-        q_pos = (cache_lens[:, None] + torch.arange(q_len, device=device)).to(torch.int32)
-        # Token-major from here on: that is the layout the fused norms and attention kernels take.
-        hidden_states = self.embed_tokens(input_ids).flatten(0, 1)
-        seq_lens = (cache_lens + q_len).to(torch.int32)
-
-        cum_seq_lens_q = cum_seq_lens_kv = None
-        if q_len == 1:
-            max_seq_len = k_cache.shape[1] * k_cache.shape[2]
-        else:
-            max_seq_len = block_tables.shape[1] * k_cache.shape[2]  # upper bound, no device sync
-            cum_seq_lens_q = torch.arange(batch + 1, dtype=torch.int32, device=device) * q_len
-            cum_seq_lens_kv = F.pad(seq_lens.cumsum(0, dtype=torch.int32), (1, 0))
+        hidden_states = self.embed_tokens(input_ids)
 
         attn = AttentionMetadata(
-            position_ids=q_pos.flatten(), 
+            position_ids=positions,
             cos_sin_cache=self.cos_sin_cache,
             block_tables=block_tables,
-            batch_indices=torch.arange(batch, dtype=torch.int32, device=device).repeat_interleave(q_len),
+            batch_indices=batch_indices,
             kv_indptr=torch.arange(batch + 1, dtype=torch.int32, device=device) * block_tables.shape[1],
             kv_last_page_len=(seq_lens - 1) % k_cache.shape[2] + 1,
             seq_lens=seq_lens,
-            max_seq_len=max_seq_len,
-            q_len=q_len,
-            cum_seq_lens_q=cum_seq_lens_q,
-            cum_seq_lens_kv=cum_seq_lens_kv,
+            num_decodes=num_decodes,
+            num_prefills=num_prefills,
+            max_seq_len=k_cache.shape[1] * k_cache.shape[2],
+            max_q_len=num_tokens - num_decodes,
+            max_kv_len=block_tables.shape[1] * k_cache.shape[2],
+            cum_seq_lens_q=cu_seqlens_q,
+            cum_seq_lens_kv=F.pad(seq_lens[num_decodes:].cumsum(0, dtype=torch.int32), (1, 0)),
             workspace=_workspace(device),
         )
 
@@ -289,7 +304,7 @@ class Devstral2Model(nn.Module):
         fused_add_rmsnorm(
             hidden_states, residual, self.norm, self.config.rms_norm_eps, enable_pdl=True
         )
-        return hidden_states.unflatten(0, (batch, q_len))
+        return hidden_states
 
 
 class Devstral2ForCausalLM(Model):
@@ -301,10 +316,14 @@ class Devstral2ForCausalLM(Model):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
-    def forward(self, input_ids: torch.Tensor, *, logits_to_keep: int = 0, **kwargs: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, **kwargs: torch.Tensor) -> torch.Tensor:
+        """Logits of each sequence's last token, (batch, vocab_size)."""
         hidden_states = self.model(input_ids, **kwargs)
-        if logits_to_keep:
-            hidden_states = hidden_states[:, -logits_to_keep:]
+        cu_seqlens_q = kwargs["cu_seqlens_q"]
+        if cu_seqlens_q.shape[0] > 1:   # prompt rows: keep only their last token
+            num_decodes = kwargs["seq_lens"].shape[0] - (cu_seqlens_q.shape[0] - 1)
+            last = torch.cat([torch.arange(num_decodes, device=cu_seqlens_q.device), num_decodes + cu_seqlens_q[1:] - 1])
+            hidden_states = hidden_states[last]
         return self.lm_head(hidden_states)
 
     # ---- checkpoint loading -------------------------------------------------

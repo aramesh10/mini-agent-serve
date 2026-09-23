@@ -20,6 +20,7 @@ class Sequence:
         self.token_ids = token_ids
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0          # tokens whose K/V are already in the cache
+        self.num_new_tokens = 0             # tokens scheduled into the current step
         self.block_table: list[int] = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens

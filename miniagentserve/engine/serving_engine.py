@@ -4,6 +4,7 @@ serving_engine.py
 import itertools
 import logging
 import os
+import threading
 import time
 from typing import Callable
 from collections import deque
@@ -19,13 +20,20 @@ logger = logging.getLogger(__name__)
 
 class ServingEngine:
 
-    def __init__(self, path: str, num_blocks: int = 4096, block_size: int = 16, max_num_seqs: int = 64):
-        self.model_runner = ModelRunner(path, num_blocks, block_size)
+    def __init__(self, path: str, 
+                 num_blocks: int = 4096, 
+                 block_size: int = 16, 
+                 max_num_seqs: int = 64,
+                 max_num_batched_tokens: int = 512):
+        assert max_num_batched_tokens >= 2 * max_num_seqs, "every running sequence must fit its decode token, plus graph padding"
+        self.model_runner = ModelRunner(path, num_blocks, block_size, max_num_seqs, max_num_batched_tokens)
         self.tokenizer = Tokenizer.from_file(os.path.join(_resolve_checkpoint_dir(path), "tokenizer.json"))
         self.max_num_seqs = max_num_seqs
+        self.max_num_batched_tokens = max_num_batched_tokens   # per step: decodes plus prompt chunks
         self.block_manager = KVBlockManager(num_blocks, block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        self.new_request = threading.Event()                   # wakes an idle `run`
         self.num_generated_tokens = 0
         self.request_metrics: deque[dict] = deque(maxlen=100)  # most recent finished requests
         self.request_ids = itertools.count()                   # in finish order, so readers can tell which are new
@@ -36,6 +44,10 @@ class ServingEngine:
             self.add_request("warmup " * (i + 1), SamplingParams(max_tokens=4))
             while not self.has_no_work():
                 self.step()
+        for i in range(n):  # together, and longer than a step's budget: chunked prompts mixed with decodes
+            self.add_request("warmup " * (i * self.max_num_batched_tokens // 4 + 1), SamplingParams(max_tokens=4))
+        while not self.has_no_work():
+            self.step()
         self.num_generated_tokens = 0
         self.request_metrics.clear()
         self.request_ids = itertools.count()
@@ -44,7 +56,8 @@ class ServingEngine:
         """Engine loop: runs until the process exits, and outlives any one request's failures."""
         while True:
             if self.has_no_work():
-                time.sleep(0.001)
+                self.new_request.wait()
+                self.new_request.clear()        # safe: the loop re-checks for work before waiting again
                 continue
             for seq in self.step():
                 try:
@@ -58,6 +71,7 @@ class ServingEngine:
         prompt = [bos_token_id] + self.tokenizer.encode(prompt).ids
         seq = Sequence(prompt, sampling_params, on_token)
         self.waiting.append(seq)
+        self.new_request.set()
         return seq
 
     def preempt(self, seq: Sequence):
@@ -66,38 +80,45 @@ class ServingEngine:
         self.waiting.appendleft(seq)
 
     def schedule(self) -> list[Sequence]:
-        if self.waiting and len(self.running) < self.max_num_seqs:
-            seq = self.waiting[0]
+        # graphs pad decodes up to a captured row count: reserve that padding, so a full step still fits the budget
+        num_decodes = sum(len(seq) - seq.num_cached_tokens == 1 for seq in self.running)
+        budget = self.max_num_batched_tokens - (self.model_runner.decode_rows(num_decodes) or num_decodes) + num_decodes
+        running, self.running = self.running, deque()
+        while running:   
+            seq = running.popleft()     # oldest first
+            while not self.block_manager.can_allocate(seq) and running:
+                self.preempt(running.pop())
             if self.block_manager.can_allocate(seq):
-                self.waiting.popleft()
-                self.block_manager.allocate(seq)
-                self.running.append(seq)
-                return [seq]
-
-        scheduled = []
-        while self.running:
-            seq = self.running.popleft()
-            while not self.block_manager.can_allocate(seq):
-                if self.running:
-                    self.preempt(self.running.pop())
-                else:
-                    self.preempt(seq)
-                    break
+                budget -= self.admit(seq, budget)
             else:
-                self.block_manager.allocate(seq)
-                scheduled.append(seq)
-        self.running.extend(scheduled)
-        return scheduled
+                self.preempt(seq)
+        while (self.waiting and budget 
+               and len(self.running) < self.max_num_seqs
+               and self.block_manager.can_allocate(self.waiting[0])):
+            budget -= self.admit(self.waiting.popleft(), budget)
+        return list(self.running)
+
+    def admit(self, seq: Sequence, budget: int) -> int:
+        self.block_manager.allocate(seq)
+        seq.num_new_tokens = min(len(seq) - seq.num_cached_tokens, budget)
+        self.running.append(seq)
+        return seq.num_new_tokens
 
     def step(self) -> list[Sequence]:
         """Runs one forward step and returns the sequences that advanced in it."""
         seqs = self.schedule()
+        if not seqs:
+            return []
         token_ids = self.model_runner.run(seqs)
-        eos_token_id = self.model_runner.model.config.eos_token_id
         now = time.perf_counter()
-        self.num_generated_tokens += len(seqs)
+        
+        eos_token_id = self.model_runner.model.config.eos_token_id
+        advanced = []
         for seq, token_id in zip(seqs, token_ids):
-            seq.num_cached_tokens = len(seq)
+            seq.num_cached_tokens += seq.num_new_tokens
+            if seq.num_cached_tokens < len(seq):   # a prompt chunk short of the end: its sample is discarded
+                continue
+            advanced.append(seq)
             seq.token_ids.append(token_id)
             seq.first_token_time = seq.first_token_time or now
             seq.finished = token_id == eos_token_id or len(seq.completion_token_ids) == seq.max_tokens
@@ -105,7 +126,8 @@ class ServingEngine:
                 self.running.remove(seq)
                 self.block_manager.deallocate(seq)
                 self.request_metrics.append(self.request_stats(seq, now))
-        return seqs
+        self.num_generated_tokens += len(advanced)
+        return advanced
 
     def request_stats(self, seq: Sequence, now: float) -> dict:
         n = len(seq.completion_token_ids)
