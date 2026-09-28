@@ -23,9 +23,10 @@ class ServingEngine:
                  num_blocks: int = 4096, 
                  block_size: int = 16, 
                  max_num_seqs: int = 64,
-                 max_num_batched_tokens: int = 512):
+                 max_num_batched_tokens: int = 512,
+                 max_model_len: int = 8192):
         assert max_num_batched_tokens >= 2 * max_num_seqs, "every running sequence must fit its decode token, plus graph padding"
-        self.model_runner = ModelRunner(path, num_blocks, block_size, max_num_seqs, max_num_batched_tokens)
+        self.model_runner = ModelRunner(path, num_blocks, block_size, max_num_seqs, max_num_batched_tokens, max_model_len)
         self.tokenizer = Tokenizer.from_file(os.path.join(_resolve_checkpoint_dir(path), "tokenizer.json"))
         self.max_num_seqs = max_num_seqs
         self.max_num_batched_tokens = max_num_batched_tokens   # per step: decodes plus prompt chunks
@@ -34,6 +35,7 @@ class ServingEngine:
         self.running: deque[Sequence] = deque()
         self.new_request = threading.Event()
         self.num_generated_tokens = 0
+        self.num_prompt_tokens = 0
         self.request_metrics: deque[dict] = deque(maxlen=100)  
         self.request_ids = itertools.count()
     
@@ -61,6 +63,12 @@ class ServingEngine:
     def add_request(self, prompt: str, sampling_params: SamplingParams = SamplingParams(), on_token: Callable[[str, bool], None] | None = None):
         bos_token_id = self.model_runner.model.config.bos_token_id
         prompt = [bos_token_id] + self.tokenizer.encode(prompt).ids
+        # a sequence that can never fit in the cache would wait at the head of the queue forever
+        capacity = self.block_manager.total_blocks * self.block_manager.block_size
+        if len(prompt) + sampling_params.max_tokens > capacity:
+            raise ValueError(f"prompt ({len(prompt)} tokens) plus max_output_tokens ({sampling_params.max_tokens}) "
+                             f"exceeds the KV cache capacity of {capacity} tokens")
+        self.num_prompt_tokens += len(prompt)
         seq = Sequence(prompt, sampling_params, on_token)
         self.waiting.append(seq)
         self.new_request.set()

@@ -8,8 +8,9 @@ from miniagentserve.engine.serving_engine import ServingEngine
 
 class MetricsSampler:
 
-    def __init__(self, engine: ServingEngine, history: int = 60, interval_s: float = 0.5):
+    def __init__(self, engine: ServingEngine, out_q, history: int = 60, interval_s: float = 0.5):
         self.engine = engine
+        self.out_q = out_q                                 # sends samples to the API process
         self.interval_s = interval_s
         self.samples: deque[dict] = deque(maxlen=history)  # most recent engine samples
 
@@ -24,5 +25,10 @@ class MetricsSampler:
                 "gpu_utilization": torch.cuda.utilization(self.engine.model_runner.device) / 100,
                 "kv_cache_utilization": round(self.engine.block_manager.utilization(), 4),
                 "queueing_latency_ms": round(max((now - seq.enqueue_time for seq in waiting), default=0) * 1e3, 2),
+                "num_requests_running": len(self.engine.running),
+                "num_requests_waiting": len(waiting),
+                "prompt_tokens_total": self.engine.num_prompt_tokens,
+                "generation_tokens_total": tokens,
             })
+            self.out_q.put(("metrics", self.samples[-1], list(self.engine.request_metrics)))
             last_time, last_tokens = now, tokens
