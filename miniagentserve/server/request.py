@@ -10,6 +10,8 @@ class ResponsesRequest(BaseModel):
     input: str | list[dict]
     max_output_tokens: int = 64
     temperature: float = 0.0
+    ignore_eos: bool = False    # generate exactly max_output_tokens (vLLM's extension), for workload-identical benchmarks
+    skip_special_tokens: bool = True    # False streams control tokens too (vLLM's extension), for clients that parse tool calls
 
     def prompt(self) -> str:
         """Raw prompt text: `input` as-is, or the text of its message items concatenated."""

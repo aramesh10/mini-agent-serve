@@ -23,7 +23,7 @@ class ServingEngine:
                  num_blocks: int = 4096, 
                  block_size: int = 16, 
                  max_num_seqs: int = 64,
-                 max_num_batched_tokens: int = 512,
+                 max_num_batched_tokens: int = 16384,
                  max_model_len: int = 8192):
         assert max_num_batched_tokens >= 2 * max_num_seqs, "every running sequence must fit its decode token, plus graph padding"
         self.model_runner = ModelRunner(path, num_blocks, block_size, max_num_seqs, max_num_batched_tokens, max_model_len)
@@ -90,6 +90,7 @@ class ServingEngine:
         pending = []
         for seq in seqs:
             seq.num_cached_tokens += seq.num_new_tokens
+            self.block_manager.commit(seq)
             if seq.num_cached_tokens < len(seq): # chunked prefill
                 continue
             seq.token_ids.append(-1 - seq.row)
@@ -118,7 +119,7 @@ class ServingEngine:
             # update sequence 
             seq.token_ids[i] = sampled_token
             seq.first_token_time = seq.first_token_time or now
-            seq.finished = (sampled_token == eos_token_id  or i + 1 - seq.num_prompt_tokens == seq.max_tokens)
+            seq.finished = ((sampled_token == eos_token_id and not seq.ignore_eos) or i + 1 - seq.num_prompt_tokens == seq.max_tokens)
             
             # release if finished
             if seq.finished: self.release_sequence(seq, i, now)

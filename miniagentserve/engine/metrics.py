@@ -29,6 +29,8 @@ class MetricsSampler:
                 "num_requests_waiting": len(waiting),
                 "prompt_tokens_total": self.engine.num_prompt_tokens,
                 "generation_tokens_total": tokens,
+                "prefix_cache_queries_total": self.engine.block_manager.num_query_tokens,
+                "prefix_cache_hits_total": self.engine.block_manager.num_hit_tokens,
             })
             self.out_q.put(("metrics", self.samples[-1], list(self.engine.request_metrics)))
             last_time, last_tokens = now, tokens

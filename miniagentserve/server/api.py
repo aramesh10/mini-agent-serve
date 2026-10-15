@@ -52,7 +52,8 @@ async def responses(req: ResponsesRequest):
     """OpenAI Responses API-compatible SSE streaming endpoint."""
     loop = asyncio.get_running_loop()
     queue = asyncio.Queue()
-    params = SamplingParams(temperature=req.temperature, max_tokens=req.max_output_tokens)
+    params = SamplingParams(temperature=req.temperature, max_tokens=req.max_output_tokens, ignore_eos=req.ignore_eos,
+                            skip_special_tokens=req.skip_special_tokens)
     rid = next(request_ids)
     streams[rid] = (loop, queue)
     in_q.put((rid, req.prompt(), params))
@@ -96,9 +97,8 @@ def prometheus_metrics():
         ("num_requests_waiting", "gauge", "num_requests_waiting", "Requests waiting to be scheduled."),
         ("prompt_tokens_total", "counter", "prompt_tokens_total", "Prompt tokens received."),
         ("generation_tokens_total", "counter", "generation_tokens_total", "Tokens generated."),
-        # no prefix caching yet: every prompt token is a lookup that misses
-        ("prefix_cache_queries_total", "counter", "prompt_tokens_total", "Prefix cache queries, in prompt tokens."),
-        ("prefix_cache_hits_total", "counter", None, "Prefix cache hits, in tokens (always 0: prefix caching not supported)."),
+        ("prefix_cache_queries_total", "counter", "prefix_cache_queries_total", "Prefix cache queries, in tokens."),
+        ("prefix_cache_hits_total", "counter", "prefix_cache_hits_total", "Prefix cache hits, in tokens."),
     ):
         lines += [f"# HELP miniagentserve:{name} {help_text}", f"# TYPE miniagentserve:{name} {kind}",
                   f"miniagentserve:{name} {float(s.get(key, 0) if key else 0)}"]

@@ -14,7 +14,8 @@ def run_engine(path: str, in_q, out_q):
     # KV cache size and the longest sequence the CUDA graphs cover; longer sequences run eagerly
     engine = ServingEngine(path,
                            num_blocks=int(os.environ.get("MAS_NUM_BLOCKS", 4096)),
-                           max_model_len=int(os.environ.get("MAS_MAX_MODEL_LEN", 8192)))
+                           max_model_len=int(os.environ.get("MAS_MAX_MODEL_LEN", 8192)),
+                           max_num_batched_tokens=int(os.environ.get("MAS_MAX_NUM_BATCHED_TOKENS", 16384)))
     sampler = MetricsSampler(engine, out_q)
     threading.Thread(target=engine.run, daemon=True).start()
     threading.Thread(target=sampler.run, daemon=True).start()

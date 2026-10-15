@@ -17,6 +17,7 @@ from miniagentserve.models.devstral2.devstral2 import Devstral2ForCausalLM
 
 GRAPH_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]    
 TOKEN_STEP = 64                                 
+MAX_GRAPH_TOKENS = 512                          # larger steps are prefill-bound and run eagerly: launch overhead is negligible there
 PREFILL_ROWS = 17                               
 
 torch._dynamo.config.recompile_limit = 64       # one compiled variant per decode/prompt mix the graphs capture
@@ -84,7 +85,7 @@ class ModelRunner:
         self.v_cache = torch.zeros(kv_shape, dtype=config.kv_dtype, device=self.device)
         
         self.graph_shapes = [(d, d) for d in GRAPH_BATCH_SIZES] + [   # decode only, then with prompts
-            (d, t) for d in [0, *GRAPH_BATCH_SIZES] for t in range(TOKEN_STEP, max_num_batched_tokens + TOKEN_STEP, TOKEN_STEP) if t > d
+            (d, t) for d in [0, *GRAPH_BATCH_SIZES] for t in range(TOKEN_STEP, min(max_num_batched_tokens, MAX_GRAPH_TOKENS) + TOKEN_STEP, TOKEN_STEP) if t > d
         ]
         self.graph_buffers = {
             shape: torch.zeros(ModelRunnerGraphInputs.nbytes(*self.dims(*shape), self.max_blocks), dtype=torch.uint8, device=self.device)

@@ -90,6 +90,7 @@ def _yarn_cos_sin_cache(config: Devstral2Config) -> torch.Tensor:
     return torch.cat((freqs.cos(), freqs.sin()), dim=-1) * attention_scaling
 
 
+@torch.compile(dynamic=True)
 def quantize_fp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return (x / scale).clamp(-FP8_MAX, FP8_MAX).to(FP8)
 
